@@ -1,0 +1,24 @@
+[
+  {
+    "external_id": "PAT-1001",
+    "full_name": "Aarav Kulkarni",
+    "age": 42,
+    "gender": "male",
+    "preferred_language": "marathi"
+  },
+  {
+    "external_id": "PAT-1002",
+    "full_name": "Sonal Sharma",
+    "age": 31,
+    "gender": "female",
+    "preferred_language": "hindi"
+  },
+  {
+    "external_id": "PAT-1003",
+    "full_name": "Rohan Mehta",
+    "age": 54,
+    "gender": "male",
+    "preferred_language": "english"
+  }
+]
+
