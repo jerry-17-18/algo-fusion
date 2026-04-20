@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
+import time
 from typing import Any
 
 import httpx
 from openai import OpenAI
+import structlog
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 from app.core.config import settings
@@ -15,6 +19,9 @@ from app.schemas.record import DoctorAssistResponse, RAGAnswer, RAGCitation, Str
 class ClinicalLLMService:
     def __init__(self) -> None:
         self._openai_client: OpenAI | None = None
+        self._logger = structlog.get_logger(__name__)
+        self._ollama_start_attempted = False
+        self._resolved_ollama_model: str | None = None
 
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
     def extract_structured_data(self, transcript: str) -> StructuredClinicalData:
@@ -57,9 +64,7 @@ Transcript:
         raw_response = self._generate_json(prompt)
         structured_data = StructuredClinicalData.model_validate(self._extract_json(raw_response))
         structured_data = self._normalize_to_english(structured_data)
-        if not structured_data.diagnosis:
-            structured_data.diagnosis = self._infer_diagnosis_from_transcript(transcript)
-        return structured_data
+        return self._merge_structured_data(structured_data, self.fallback_structured_data(transcript))
 
     def doctor_assist(
         self,
@@ -126,18 +131,21 @@ Context:
     def _generate_json(self, prompt: str) -> str:
         try:
             return self._generate_with_ollama(prompt, json_mode=True)
-        except Exception:
+        except Exception as exc:
+            self._logger.warning("ollama_json_generation_failed", error=str(exc))
             return self._generate_with_openai(prompt, json_mode=True)
 
     def _generate_text(self, prompt: str) -> str:
         try:
             return self._generate_with_ollama(prompt, json_mode=False)
-        except Exception:
+        except Exception as exc:
+            self._logger.warning("ollama_text_generation_failed", error=str(exc))
             return self._generate_with_openai(prompt, json_mode=False)
 
     def _generate_with_ollama(self, prompt: str, json_mode: bool) -> str:
+        model_name = self._ensure_ollama_model()
         payload = {
-            "model": settings.ollama_model,
+            "model": model_name,
             "prompt": prompt,
             "stream": False,
             "options": {"temperature": 0.1},
@@ -145,13 +153,137 @@ Context:
         if json_mode:
             payload["format"] = "json"
 
-        response = httpx.post(
-            f"{settings.ollama_base_url}/api/generate",
-            json=payload,
-            timeout=120,
-        )
+        response = httpx.post(f"{settings.ollama_base_url}/api/generate", json=payload, timeout=120)
         response.raise_for_status()
-        return response.json()["response"]
+        content = response.json().get("response", "")
+        if not content.strip():
+            raise RuntimeError(f"Ollama model '{model_name}' returned an empty response")
+        return content
+
+    def fallback_structured_data(self, transcript: str) -> StructuredClinicalData:
+        normalized_transcript = self._translate_common_clinical_terms(transcript)
+        normalized_transcript = normalized_transcript.translate(str.maketrans("०१२३४५६७८९", "0123456789"))
+        normalized_text = normalized_transcript.lower()
+
+        symptom_map = {
+            "fever": ["fever", "temperature", "viral fever"],
+            "cough": ["cough"],
+            "cold": ["cold", "common cold"],
+            "sore throat": ["sore throat", "throat pain"],
+            "abdominal pain": ["abdominal pain", "stomach pain"],
+            "headache": ["headache"],
+            "vomiting": ["vomiting", "vomit"],
+            "diarrhea": ["diarrhea", "loose motion", "loose motions"],
+            "weakness": ["weakness", "fatigue"],
+            "dizziness": ["dizziness"],
+            "body ache": ["body ache", "body pain", "body aches"],
+            "shortness of breath": ["shortness of breath", "breathlessness"],
+        }
+
+        symptoms: list[str] = []
+        for canonical, aliases in symptom_map.items():
+            if any(self._contains_phrase(normalized_text, alias) for alias in aliases):
+                symptoms.append(canonical)
+
+        medications = self._extract_medications(normalized_text)
+        duration = self._extract_duration(normalized_transcript)
+        diagnosis = self._infer_diagnosis_from_transcript(transcript)
+
+        fallback = StructuredClinicalData(
+            symptoms=symptoms,
+            duration=duration,
+            diagnosis=diagnosis,
+            medications=medications,
+        )
+        return self._normalize_to_english(fallback)
+
+    def _ensure_ollama_model(self) -> str:
+        self._ensure_ollama_server()
+        available_models = self._list_ollama_models()
+        if not available_models:
+            raise RuntimeError("Ollama is running but no local models are available")
+
+        configured_model = settings.ollama_model.strip()
+        if configured_model in available_models:
+            self._resolved_ollama_model = configured_model
+            return configured_model
+
+        configured_base = configured_model.split(":", 1)[0]
+        base_match = next(
+            (model for model in available_models if model == configured_base or model.startswith(f"{configured_base}:")),
+            None,
+        )
+        if base_match:
+            self._resolved_ollama_model = base_match
+            self._logger.warning(
+                "configured_ollama_model_missing_using_closest_match",
+                configured_model=configured_model,
+                selected_model=base_match,
+            )
+            return base_match
+
+        preferred_models = ("llama3.2:3b", "llama3.2", "llama3.1:8b", "mistral", "qwen2.5")
+        for preferred in preferred_models:
+            match = next(
+                (model for model in available_models if model == preferred or model.startswith(f"{preferred}:")),
+                None,
+            )
+            if match:
+                self._resolved_ollama_model = match
+                self._logger.warning(
+                    "configured_ollama_model_missing_using_fallback",
+                    configured_model=configured_model,
+                    selected_model=match,
+                )
+                return match
+
+        self._resolved_ollama_model = available_models[0]
+        self._logger.warning(
+            "configured_ollama_model_missing_using_first_available",
+            configured_model=configured_model,
+            selected_model=available_models[0],
+        )
+        return available_models[0]
+
+    def _ensure_ollama_server(self) -> None:
+        if self._ollama_is_available():
+            return
+        if not shutil.which("ollama"):
+            raise RuntimeError("Ollama binary is not installed")
+        if not self._ollama_start_attempted:
+            self._ollama_start_attempted = True
+            self._logger.warning("starting_ollama_server", base_url=settings.ollama_base_url)
+            subprocess.Popen(
+                ["ollama", "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if self._ollama_is_available():
+                return
+            time.sleep(0.5)
+        raise RuntimeError(f"Ollama is not reachable at {settings.ollama_base_url}")
+
+    def _ollama_is_available(self) -> bool:
+        try:
+            response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=2)
+            response.raise_for_status()
+            return True
+        except Exception:
+            return False
+
+    def _list_ollama_models(self) -> list[str]:
+        response = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=5)
+        response.raise_for_status()
+        payload = response.json()
+        models = payload.get("models", [])
+        return [
+            model.get("name", "").strip()
+            for model in models
+            if isinstance(model, dict) and model.get("name", "").strip()
+        ]
 
     @staticmethod
     def _infer_diagnosis_from_transcript(transcript: str) -> str:
@@ -268,6 +400,8 @@ Context:
         normalized = re.sub(r"\s+", " ", normalized).strip()
         aliases = {
             "crocin": "paracetamol",
+            "crossin": "paracetamol",
+            "crosin": "paracetamol",
             "dolo": "paracetamol",
             "acetaminophen": "paracetamol",
             "combiflam": "ibuprofen",
@@ -293,6 +427,61 @@ Context:
         for source, target in replacements.items():
             normalized = re.sub(re.escape(source), target, normalized, flags=re.IGNORECASE)
         return normalized
+
+    @staticmethod
+    def _contains_phrase(text: str, phrase: str) -> bool:
+        pattern = r"\b" + r"\s+".join(re.escape(part) for part in phrase.split()) + r"\b"
+        return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
+    @classmethod
+    def _extract_duration(cls, transcript: str) -> str:
+        normalized = cls._translate_common_clinical_terms(transcript)
+        normalized = normalized.translate(str.maketrans("०१२३४५६७८९", "0123456789"))
+
+        patterns = [
+            r"(?:for|since)\s+(\d+\s+(?:day|days|week|weeks|month|months|year|years))\b",
+            r"\b(\d+\s+(?:day|days|week|weeks|month|months|year|years))\b",
+            r"\b(since yesterday|since today|today morning|this morning)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, normalized, flags=re.IGNORECASE)
+            if match:
+                return cls._normalize_duration(match.group(1).lower())
+        return ""
+
+    @classmethod
+    def _extract_medications(cls, normalized_text: str) -> list[str]:
+        medication_aliases = {
+            "paracetamol": ["paracetamol", "crocin", "crossin", "crosin", "dolo", "acetaminophen"],
+            "ibuprofen": ["ibuprofen", "combiflam"],
+            "azithromycin": ["azithromycin"],
+            "amoxicillin": ["amoxicillin"],
+            "metformin": ["metformin"],
+            "cetirizine": ["cetirizine"],
+            "omeprazole": ["omeprazole"],
+        }
+
+        medications: list[str] = []
+        for canonical, aliases in medication_aliases.items():
+            if any(cls._contains_phrase(normalized_text, alias) for alias in aliases):
+                medications.append(canonical)
+        return medications
+
+    @staticmethod
+    def _merge_structured_data(
+        structured_data: StructuredClinicalData,
+        fallback_data: StructuredClinicalData,
+    ) -> StructuredClinicalData:
+        return StructuredClinicalData(
+            symptoms=ClinicalLLMService._unique_preserve_order(
+                structured_data.symptoms + fallback_data.symptoms
+            ),
+            duration=structured_data.duration or fallback_data.duration,
+            diagnosis=structured_data.diagnosis or fallback_data.diagnosis,
+            medications=ClinicalLLMService._unique_preserve_order(
+                structured_data.medications + fallback_data.medications
+            ),
+        )
 
     def _generate_with_openai(self, prompt: str, json_mode: bool) -> str:
         if not settings.openai_api_key:

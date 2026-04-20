@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import structlog
 from sqlalchemy.orm import Session
 
 from app.models.record import Record
@@ -25,6 +26,7 @@ class ClinicalPipelineService:
     def __init__(self, llm_service: ClinicalLLMService) -> None:
         self.llm_service = llm_service
         self.medication_validator = MedicationValidatorService()
+        self._logger = structlog.get_logger(__name__)
 
     def append_transcript_chunk(
         self,
@@ -185,8 +187,15 @@ class ClinicalPipelineService:
             structured_data = self.medication_validator.normalize(
                 self.llm_service.extract_structured_data(transcript)
             )
+        except Exception as exc:
+            self._logger.exception("structured_data_extraction_failed", error=str(exc))
+            structured_data = self.medication_validator.normalize(
+                self.llm_service.fallback_structured_data(transcript)
+            )
+
+        try:
             doctor_assist = self.llm_service.doctor_assist(transcript, structured_data)
-        except Exception:
-            structured_data = StructuredClinicalData()
+        except Exception as exc:
+            self._logger.exception("doctor_assist_generation_failed", error=str(exc))
             doctor_assist = self.llm_service._fallback_assist(structured_data)
         return structured_data, doctor_assist

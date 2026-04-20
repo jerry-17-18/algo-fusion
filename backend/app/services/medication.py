@@ -7,6 +7,8 @@ class MedicationValidatorService:
             "acetaminophen": "paracetamol",
             "paracetamol": "paracetamol",
             "crocin": "paracetamol",
+            "crossin": "paracetamol",
+            "crosin": "paracetamol",
             "dolo": "paracetamol",
             "ibuprofen": "ibuprofen",
             "combiflam": "ibuprofen",
@@ -27,7 +29,7 @@ class MedicationValidatorService:
                 continue
 
             lookup = candidate.lower().replace("tablet", "").replace("tab", "").strip()
-            canonical = self.known_drugs.get(lookup, candidate.lower().title())
+            canonical = self.known_drugs.get(lookup, candidate.lower())
             if canonical.lower() in seen:
                 continue
             seen.add(canonical.lower())
@@ -35,4 +37,3 @@ class MedicationValidatorService:
 
         structured_data.medications = normalized
         return structured_data
-

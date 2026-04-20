@@ -167,14 +167,13 @@ npm run dev
 This repo is configured for a Vercel multi-service deployment:
 
 - `frontend/` serves the React + Vite app at `/`
-- `api/index.py` serves FastAPI at `/api`
+- `backend/vercel_app.py` serves FastAPI at `/api`
 
 Key files:
 
 - `vercel.json`
 - `.vercelignore`
-- `api/index.py`
-- `api/requirements.txt`
+- `backend/vercel_app.py`
 
 ### Required Vercel project settings
 

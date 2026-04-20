@@ -19,17 +19,17 @@ from app.services.extraction import ClinicalLLMService
 
 try:
     import faiss  # type: ignore
-except Exception:  # pragma: no cover - optional on Vercel
+except Exception:  # pragma: no cover - optional on lightweight deployments
     faiss = None
 
 try:
     import numpy as np  # type: ignore
-except Exception:  # pragma: no cover - optional on Vercel
+except Exception:  # pragma: no cover - optional on lightweight deployments
     np = None
 
 try:
     from sentence_transformers import SentenceTransformer  # type: ignore
-except Exception:  # pragma: no cover - optional on Vercel
+except Exception:  # pragma: no cover - optional on lightweight deployments
     SentenceTransformer = None
 
 

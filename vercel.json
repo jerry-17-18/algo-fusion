@@ -6,7 +6,7 @@
       "routePrefix": "/"
     },
     "api": {
-      "entrypoint": "api/index.py",
+      "entrypoint": "backend/vercel_app.py",
       "routePrefix": "/api",
       "maxDuration": 300
     }
